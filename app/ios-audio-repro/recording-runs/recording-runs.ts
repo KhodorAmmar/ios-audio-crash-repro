@@ -41,7 +41,7 @@ function parseRuns(raw: string | null): RecordingRun[] {
   }
 }
 
-/** Legacy runs may omit newer keys (e.g. r3fIframe). */
+/** Legacy runs may omit newer keys — defaults are backfilled. */
 function readFeatures(x: unknown): ReproFeatures | undefined {
   if (x === null || typeof x !== "object") return undefined;
   const o = x as Record<string, unknown>;
@@ -54,12 +54,27 @@ function readFeatures(x: unknown): ReproFeatures | undefined {
   }
   if (o.r3fIframe !== undefined && typeof o.r3fIframe !== "boolean") return undefined;
   if (o.mutationObserverAll !== undefined && typeof o.mutationObserverAll !== "boolean") return undefined;
+
+  const bool = (key: string, fallback: boolean) =>
+    typeof o[key] === "boolean" ? (o[key] as boolean) : fallback;
+  const num = (key: string, fallback: number) =>
+    typeof o[key] === "number" ? (o[key] as number) : fallback;
+
   return {
     waveform: o.waveform,
     heavyIframe: o.heavyIframe,
-    r3fIframe: typeof o.r3fIframe === "boolean" ? o.r3fIframe : false,
+    r3fIframe: bool("r3fIframe", false),
     motionLoop: o.motionLoop,
-    mutationObserverAll: typeof o.mutationObserverAll === "boolean" ? o.mutationObserverAll : false,
+    mutationObserverAll: bool("mutationObserverAll", false),
+
+    recorderRestartCycle: bool("recorderRestartCycle", false),
+    recorderRestartIntervalSec: num("recorderRestartIntervalSec", 30),
+    waveformFpsCap: num("waveformFpsCap", 0),
+    analyserDisconnectBetweenSamples: bool("analyserDisconnectBetweenSamples", false),
+    skipAnalyserOnIos: bool("skipAnalyserOnIos", false),
+    audioContextRecreate: bool("audioContextRecreate", false),
+    audioContextRecreateIntervalSec: num("audioContextRecreateIntervalSec", 60),
+    releaseChunks: bool("releaseChunks", false),
   };
 }
 

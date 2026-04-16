@@ -220,25 +220,20 @@ export function AudioCrashRepro() {
   useEffect(() => () => cleanupRef.current(), []);
 
   // ── MediaRecorder restart cycle ──────────────────────────────────────
-  // Stops the current MediaRecorder and starts a new one on the same stream
-  // to flush the internal buffer that Safari accumulates.
+  // Start the new recorder *before* stopping the old one so that both
+  // briefly record from the same MediaStream. This eliminates the gap
+  // where samples would otherwise be dropped between stop→start. The
+  // overlap is typically < 1 ms (just two synchronous JS calls) so the
+  // duplicate data is negligible and can be trimmed when stitching.
 
   const restartMediaRecorder = useCallback(() => {
     const stream = streamRef.current;
     if (!stream) return;
 
     const oldMr = mediaRecorderRef.current;
-    if (oldMr && oldMr.state === "recording") {
-      // If releaseChunks is on, detach handler before stop so the final
-      // chunk from the old recorder is collected but previous ones freed.
-      oldMr.stop();
-    }
 
-    // Release accumulated chunks to free memory
-    if (featuresRef.current.releaseChunks) {
-      chunksRef.current = [];
-    }
-
+    // 1. Create and start the new recorder first — it begins capturing
+    //    from the live stream immediately.
     const newRecorder = new MediaRecorder(stream);
     mediaRecorderRef.current = newRecorder;
 
@@ -250,8 +245,19 @@ export function AudioCrashRepro() {
       }
     };
     newRecorder.onstop = () => {};
-
     newRecorder.start(1000);
+
+    // 2. Now stop the old recorder — its final ondataavailable fires
+    //    asynchronously, so the new one is already covering the stream.
+    if (oldMr && oldMr.state === "recording") {
+      oldMr.stop();
+    }
+
+    // Release accumulated chunks to free memory
+    if (featuresRef.current.releaseChunks) {
+      chunksRef.current = [];
+    }
+
     restartCountRef.current += 1;
     setRestartCount(restartCountRef.current);
     console.info(`[ios-audio-repro] MediaRecorder restarted (cycle #${restartCountRef.current})`);

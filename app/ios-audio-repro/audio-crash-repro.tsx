@@ -211,7 +211,13 @@ export function AudioCrashRepro() {
     audioContextRef.current = null;
   }, [teardownAudioGraph]);
 
-  useEffect(() => () => cleanup(), [cleanup]);
+  // Use a ref so the unmount effect always calls the latest cleanup without
+  // re-firing (and accidentally stopping a live recording) when the callback
+  // identity changes due to dependency updates.
+  const cleanupRef = useRef(cleanup);
+  cleanupRef.current = cleanup;
+
+  useEffect(() => () => cleanupRef.current(), []);
 
   // ── MediaRecorder restart cycle ──────────────────────────────────────
   // Stops the current MediaRecorder and starts a new one on the same stream

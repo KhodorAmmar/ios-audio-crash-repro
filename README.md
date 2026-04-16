@@ -1,36 +1,48 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ios-audio-crash
 
-## Getting Started
+Minimal **Next.js** harness to reproduce and bisect **iOS Safari tab crashes** when using the **microphone** with **`MediaRecorder`**, optional **Web Audio** (`AudioContext` → `AnalyserNode`), and optional “stress” toggles (iframes, animations, `MutationObserver`, etc.). It mirrors patterns from a larger app where recording sometimes died at a consistent wall-clock time while a lean repro was flaky—this page exists to **isolate variables** and **log what was enabled** per attempt.
 
-First, run the development server:
+## What to open on the phone
+
+- **`/`** — short intro + link to the repro.
+- **`/ios-audio-repro`** — main experiment: start/stop recording, elapsed time, optional waveform, stressors, and a **run history** backed by `localStorage`.
+
+## Behavior
+
+- **Recording path:** `getUserMedia({ audio: true })` → optionally `AudioContext` + analyser (when **Waveform** is on) → `MediaRecorder` with a **1s timeslice** so chunk counts update during recording.
+- **Runs:** Each session appends a row with **elapsed seconds** (updated while recording). **Stop** marks the run **done** (green “pass”). If the tab **crashes or reloads** without Stop, any run left **running** is marked **crashed** on the next full page load.
+- **Feature flags** are persisted (localStorage) and **snapshotted per run** so you can correlate crashes with toggles. The console also logs flags when recording starts.
+
+## Stress toggles (all optional)
+
+| Toggle | Effect |
+|--------|--------|
+| **Waveform** | `AnalyserNode` + bar visualizer (`getByteTimeDomainData` with a **reused** `Uint8Array`). Off = `MediaRecorder` only (no Web Audio graph). |
+| **Heavy iframe** | Embeds same-origin **`/heavy-embed`** (large DOM grid). |
+| **R3F iframe** | Embeds **`/r3f-embed`** (`@react-three/fiber` + WebGL scene). |
+| **Motion loop** | `motion/react` always-on animation on the parent page. |
+| **MutationObserver** | Observes **`document.documentElement`** with `subtree: true` and all relevant options (incl. old values); empty callback—cost is mainly mutation delivery on busy documents. |
+
+Supporting routes: **`/heavy-embed`**, **`/r3f-embed`** (inside iframes or standalone).
+
+## Development
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
+pnpm install
 pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then open [http://localhost:3000/ios-audio-repro](http://localhost:3000/ios-audio-repro) (use your LAN URL on a real iPhone).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+pnpm build
+pnpm lint
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Stack
 
-## Learn More
+Next.js (App Router), React, TypeScript, Tailwind, [`motion`](https://motion.dev), [`three`](https://threejs.org/) + [`@react-three/fiber`](https://docs.pmnd.rs/react-three-fiber) for the optional WebGL embed.
 
-To learn more about Next.js, take a look at the following resources:
+---
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+This repo is for **local / device experimentation**, not production voice features.

@@ -6,6 +6,7 @@ import { AudioWaveform } from "./audio-waveform/audio-waveform";
 import {
   DEFAULT_REPRO_FEATURES,
   formatFeaturesForLog,
+  isIos,
   loadFeatureToggles,
   saveFeatureToggles,
   type ReproFeatures,
@@ -30,10 +31,18 @@ function formatElapsed(totalSec: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
 /**
  * Minimal repro matching the production voice path:
  * getUserMedia → AudioContext → MediaStreamSource → AnalyserNode (2048, smoothing 0.3) + MediaRecorder (1s timeslice for visible chunks).
  * Leave recording running to test iOS Safari tab crashes (~1 min).
+ *
+ * Mitigation toggles allow testing various strategies to prevent crashes.
  */
 export function AudioCrashRepro() {
   const [phase, setPhase] = useState<Phase>("idle");
@@ -41,16 +50,24 @@ export function AudioCrashRepro() {
   const [elapsedSec, setElapsedSec] = useState(0);
   const [chunksTotalBytes, setChunksTotalBytes] = useState(0);
   const [chunkCount, setChunkCount] = useState(0);
+  const [restartCount, setRestartCount] = useState(0);
   const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
+  const [sourceNode, setSourceNode] = useState<MediaStreamAudioSourceNode | null>(null);
   const [features, setFeatures] = useState<ReproFeatures>(DEFAULT_REPRO_FEATURES);
 
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const restartTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const ctxRecreateTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startedAtRef = useRef<number | null>(null);
   const currentRunIdRef = useRef<string | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const featuresRef = useRef<ReproFeatures>(DEFAULT_REPRO_FEATURES);
+  const restartCountRef = useRef(0);
 
   const [runs, setRuns] = useState<RecordingRun[]>([]);
 
@@ -59,7 +76,9 @@ export function AudioCrashRepro() {
   }, []);
 
   useEffect(() => {
-    setFeatures(loadFeatureToggles());
+    const loaded = loadFeatureToggles();
+    setFeatures(loaded);
+    featuresRef.current = loaded;
   }, []);
 
   useEffect(() => {
@@ -85,10 +104,11 @@ export function AudioCrashRepro() {
 
   const togglesLocked = phase === "recording";
 
-  const patchFeature = useCallback((key: keyof ReproFeatures, value: boolean) => {
+  const patchFeature = useCallback(<K extends keyof ReproFeatures>(key: K, value: ReproFeatures[K]) => {
     setFeatures((prev) => {
       const next = { ...prev, [key]: value };
       saveFeatureToggles(next);
+      featuresRef.current = next;
       return next;
     });
   }, []);
@@ -97,10 +117,78 @@ export function AudioCrashRepro() {
     setRuns(sortedRunsNewestFirst(loadRuns()));
   }, []);
 
+  // ── Determine effective waveform behavior ────────────────────────────
+  const shouldSkipAnalyser = features.skipAnalyserOnIos && isIos();
+  const effectiveWaveform = features.waveform && !shouldSkipAnalyser;
+
+  // ── Core helpers ─────────────────────────────────────────────────────
+
+  const createAudioContext = useCallback((): AudioContext => {
+    const AudioContextClass =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    return new AudioContextClass();
+  }, []);
+
+  const setupAudioGraph = useCallback(
+    (ctx: AudioContext, stream: MediaStream, wantAnalyser: boolean) => {
+      const src = ctx.createMediaStreamSource(stream);
+      sourceRef.current = src;
+      setSourceNode(src);
+
+      if (wantAnalyser) {
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.3;
+        analyserRef.current = analyser;
+        setAnalyserNode(analyser);
+
+        // If using disconnect-between-samples, start disconnected — the
+        // waveform component will connect/disconnect on each sample.
+        if (!featuresRef.current.analyserDisconnectBetweenSamples) {
+          src.connect(analyser);
+        }
+      } else {
+        analyserRef.current = null;
+        setAnalyserNode(null);
+      }
+    },
+    [],
+  );
+
+  const teardownAudioGraph = useCallback(() => {
+    if (sourceRef.current) {
+      try {
+        sourceRef.current.disconnect();
+      } catch {
+        /* noop */
+      }
+      sourceRef.current = null;
+      setSourceNode(null);
+    }
+    if (analyserRef.current) {
+      try {
+        analyserRef.current.disconnect();
+      } catch {
+        /* noop */
+      }
+      analyserRef.current = null;
+      setAnalyserNode(null);
+    }
+  }, []);
+
   const cleanup = useCallback(() => {
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
+    }
+    if (restartTimerRef.current) {
+      clearInterval(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+    if (ctxRecreateTimerRef.current) {
+      clearInterval(ctxRecreateTimerRef.current);
+      ctxRecreateTimerRef.current = null;
     }
 
     const mr = mediaRecorderRef.current;
@@ -114,90 +202,142 @@ export function AudioCrashRepro() {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
 
+    teardownAudioGraph();
+
     const ctx = audioContextRef.current;
     if (ctx) {
       void ctx.close();
     }
     audioContextRef.current = null;
-    analyserRef.current = null;
-    setAnalyserNode(null);
-  }, []);
+  }, [teardownAudioGraph]);
 
   useEffect(() => () => cleanup(), [cleanup]);
+
+  // ── MediaRecorder restart cycle ──────────────────────────────────────
+  // Stops the current MediaRecorder and starts a new one on the same stream
+  // to flush the internal buffer that Safari accumulates.
+
+  const restartMediaRecorder = useCallback(() => {
+    const stream = streamRef.current;
+    if (!stream) return;
+
+    const oldMr = mediaRecorderRef.current;
+    if (oldMr && oldMr.state === "recording") {
+      // If releaseChunks is on, detach handler before stop so the final
+      // chunk from the old recorder is collected but previous ones freed.
+      oldMr.stop();
+    }
+
+    // Release accumulated chunks to free memory
+    if (featuresRef.current.releaseChunks) {
+      chunksRef.current = [];
+    }
+
+    const newRecorder = new MediaRecorder(stream);
+    mediaRecorderRef.current = newRecorder;
+
+    newRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) {
+        chunksRef.current.push(e.data);
+        setChunkCount(chunksRef.current.length);
+        setChunksTotalBytes(chunksRef.current.reduce((acc, b) => acc + b.size, 0));
+      }
+    };
+    newRecorder.onstop = () => {};
+
+    newRecorder.start(1000);
+    restartCountRef.current += 1;
+    setRestartCount(restartCountRef.current);
+    console.info(`[ios-audio-repro] MediaRecorder restarted (cycle #${restartCountRef.current})`);
+  }, []);
+
+  // ── AudioContext recreation cycle ────────────────────────────────────
+  // Closes the current AudioContext and creates a fresh one to release
+  // accumulated GPU/audio process resources.
+
+  const recreateAudioContext = useCallback(() => {
+    const stream = streamRef.current;
+    if (!stream) return;
+
+    // Tear down old graph
+    teardownAudioGraph();
+    const oldCtx = audioContextRef.current;
+    if (oldCtx) {
+      void oldCtx.close();
+    }
+
+    // Build fresh context + graph
+    const newCtx = createAudioContext();
+    audioContextRef.current = newCtx;
+
+    if (newCtx.state === "suspended") {
+      void newCtx.resume();
+    }
+
+    setupAudioGraph(newCtx, stream, effectiveWaveform);
+    console.info("[ios-audio-repro] AudioContext recreated");
+  }, [createAudioContext, setupAudioGraph, teardownAudioGraph, effectiveWaveform]);
+
+  // ── Start / Stop ─────────────────────────────────────────────────────
 
   const start = async () => {
     setError(null);
     cleanup();
+    restartCountRef.current = 0;
+    setRestartCount(0);
 
-    const featureSnapshot: ReproFeatures = {
-      waveform: features.waveform,
-      heavyIframe: features.heavyIframe,
-      r3fIframe: features.r3fIframe,
-      motionLoop: features.motionLoop,
-      mutationObserverAll: features.mutationObserverAll,
-    };
+    const featureSnapshot: ReproFeatures = { ...features };
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      if (featureSnapshot.waveform) {
-        const AudioContextClass =
-          window.AudioContext ||
-          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        const ctx = new AudioContextClass();
+      const wantAnalyser = featureSnapshot.waveform && !(featureSnapshot.skipAnalyserOnIos && isIos());
+
+      if (wantAnalyser || featureSnapshot.audioContextRecreate) {
+        const ctx = createAudioContext();
         audioContextRef.current = ctx;
 
         if (ctx.state === "suspended") {
           await ctx.resume();
         }
 
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 2048;
-        analyser.smoothingTimeConstant = 0.3;
-        analyserRef.current = analyser;
-        setAnalyserNode(analyser);
-
-        const source = ctx.createMediaStreamSource(stream);
-        source.connect(analyser);
-      } else {
-        analyserRef.current = null;
-        setAnalyserNode(null);
+        setupAudioGraph(ctx, stream, wantAnalyser);
       }
 
-      const chunks: Blob[] = [];
+      chunksRef.current = [];
       const recorder = new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
-          chunks.push(e.data);
-          setChunkCount(chunks.length);
-          setChunksTotalBytes(chunks.reduce((acc, b) => acc + b.size, 0));
+          chunksRef.current.push(e.data);
+          setChunkCount(chunksRef.current.length);
+          setChunksTotalBytes(chunksRef.current.reduce((acc, b) => acc + b.size, 0));
         }
       };
 
-      recorder.onstop = () => {
-        // hold blobs until next start if needed for debugging
-      };
+      recorder.onstop = () => {};
 
       startedAtRef.current = Date.now();
       setElapsedSec(0);
       setChunksTotalBytes(0);
       setChunkCount(0);
 
-      // `start()` with no timeslice often yields a single `dataavailable` when `stop()` runs, so chunk count stays 0
-      // while recording. A timeslice forces periodic blobs (handy to confirm recording; slightly different from
-      // one-shot buffering).
       recorder.start(1000);
       setPhase("recording");
 
-      console.info("[ios-audio-repro] recording started · features:", featureSnapshot, formatFeaturesForLog(featureSnapshot));
+      console.info(
+        "[ios-audio-repro] recording started · features:",
+        featureSnapshot,
+        formatFeaturesForLog(featureSnapshot),
+      );
 
       const run = appendRunningRun(featureSnapshot);
       currentRunIdRef.current = run.id;
       refreshRuns();
 
+      // Elapsed timer
       timerRef.current = setInterval(() => {
         const t0 = startedAtRef.current;
         if (t0 == null) return;
@@ -209,6 +349,22 @@ export function AudioCrashRepro() {
           refreshRuns();
         }
       }, 500);
+
+      // MediaRecorder restart cycle
+      if (featureSnapshot.recorderRestartCycle && featureSnapshot.recorderRestartIntervalSec > 0) {
+        restartTimerRef.current = setInterval(
+          restartMediaRecorder,
+          featureSnapshot.recorderRestartIntervalSec * 1000,
+        );
+      }
+
+      // AudioContext recreation cycle
+      if (featureSnapshot.audioContextRecreate && featureSnapshot.audioContextRecreateIntervalSec > 0) {
+        ctxRecreateTimerRef.current = setInterval(
+          recreateAudioContext,
+          featureSnapshot.audioContextRecreateIntervalSec * 1000,
+        );
+      }
     } catch (e) {
       cleanup();
       setError(e instanceof Error ? e.message : String(e));
@@ -232,6 +388,8 @@ export function AudioCrashRepro() {
     startedAtRef.current = null;
   };
 
+  // ── Render ───────────────────────────────────────────────────────────
+
   return (
     <div className="mx-auto flex max-w-lg flex-col gap-4 p-6 font-sans">
       <h1 className="text-xl font-semibold tracking-tight">iOS Safari audio repro</h1>
@@ -240,60 +398,120 @@ export function AudioCrashRepro() {
         whether total memory pressure speeds up death. Feature flags persist; each run records which stressors were on.
       </p>
 
+      {/* ── Stressors ─────────────────────────────────────────────── */}
       <fieldset className="rounded-lg border border-zinc-200 p-3 dark:border-zinc-700">
         <legend className="px-1 text-xs font-medium text-zinc-600 dark:text-zinc-400">Stressors</legend>
         <div className="flex flex-col gap-2 text-sm">
-          <label className="flex cursor-pointer items-center gap-2">
-            <input
-              type="checkbox"
-              checked={features.waveform}
-              disabled={togglesLocked}
-              onChange={(e) => patchFeature("waveform", e.target.checked)}
-            />
-            <span>Waveform (Analyser + bars)</span>
-          </label>
-          <label className="flex cursor-pointer items-center gap-2">
-            <input
-              type="checkbox"
-              checked={features.heavyIframe}
-              disabled={togglesLocked}
-              onChange={(e) => patchFeature("heavyIframe", e.target.checked)}
-            />
-            <span>Heavy iframe (same-origin /heavy-embed)</span>
-          </label>
-          <label className="flex cursor-pointer items-center gap-2">
-            <input
-              type="checkbox"
-              checked={features.r3fIframe}
-              disabled={togglesLocked}
-              onChange={(e) => patchFeature("r3fIframe", e.target.checked)}
-            />
-            <span>R3F iframe (same-origin /r3f-embed · WebGL)</span>
-          </label>
-          <label className="flex cursor-pointer items-center gap-2">
-            <input
-              type="checkbox"
-              checked={features.motionLoop}
-              disabled={togglesLocked}
-              onChange={(e) => patchFeature("motionLoop", e.target.checked)}
-            />
-            <span>Motion loop (motion/react)</span>
-          </label>
-          <label className="flex cursor-pointer items-center gap-2">
-            <input
-              type="checkbox"
-              checked={features.mutationObserverAll}
-              disabled={togglesLocked}
-              onChange={(e) => patchFeature("mutationObserverAll", e.target.checked)}
-            />
-            <span>MutationObserver on &lt;html&gt; (subtree + attrs + text + oldValues)</span>
-          </label>
+          <ToggleRow label="Waveform (Analyser + bars)" checked={features.waveform} disabled={togglesLocked} onChange={(v) => patchFeature("waveform", v)} />
+          <ToggleRow label="Heavy iframe (same-origin /heavy-embed)" checked={features.heavyIframe} disabled={togglesLocked} onChange={(v) => patchFeature("heavyIframe", v)} />
+          <ToggleRow label="R3F iframe (same-origin /r3f-embed · WebGL)" checked={features.r3fIframe} disabled={togglesLocked} onChange={(v) => patchFeature("r3fIframe", v)} />
+          <ToggleRow label="Motion loop (motion/react)" checked={features.motionLoop} disabled={togglesLocked} onChange={(v) => patchFeature("motionLoop", v)} />
+          <ToggleRow label="MutationObserver on <html> (subtree + attrs + text + oldValues)" checked={features.mutationObserverAll} disabled={togglesLocked} onChange={(v) => patchFeature("mutationObserverAll", v)} />
         </div>
         <p className="mt-2 font-mono text-[11px] text-zinc-500 dark:text-zinc-400">
           Active now: {formatFeaturesForLog(features)}
         </p>
       </fieldset>
 
+      {/* ── Mitigations ───────────────────────────────────────────── */}
+      <fieldset className="rounded-lg border border-blue-200 p-3 dark:border-blue-800">
+        <legend className="px-1 text-xs font-medium text-blue-600 dark:text-blue-400">Mitigations</legend>
+        <div className="flex flex-col gap-3 text-sm">
+          {/* Recorder restart */}
+          <div className="flex flex-col gap-1">
+            <ToggleRow
+              label="Periodic MediaRecorder stop/restart"
+              checked={features.recorderRestartCycle}
+              disabled={togglesLocked}
+              onChange={(v) => patchFeature("recorderRestartCycle", v)}
+            />
+            {features.recorderRestartCycle && (
+              <NumberInput
+                label="Interval (seconds)"
+                value={features.recorderRestartIntervalSec}
+                min={5}
+                max={300}
+                disabled={togglesLocked}
+                onChange={(v) => patchFeature("recorderRestartIntervalSec", v)}
+              />
+            )}
+          </div>
+
+          {/* Release chunks */}
+          <ToggleRow
+            label="Release chunk blobs on restart (free memory)"
+            checked={features.releaseChunks}
+            disabled={togglesLocked}
+            onChange={(v) => patchFeature("releaseChunks", v)}
+          />
+
+          {/* Waveform FPS cap */}
+          <div className="flex flex-col gap-1">
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={features.waveformFpsCap > 0}
+                disabled={togglesLocked}
+                onChange={(e) => patchFeature("waveformFpsCap", e.target.checked ? 10 : 0)}
+              />
+              <span>Throttle waveform FPS (rAF cap)</span>
+            </label>
+            {features.waveformFpsCap > 0 && (
+              <NumberInput
+                label="Target FPS"
+                value={features.waveformFpsCap}
+                min={1}
+                max={60}
+                disabled={togglesLocked}
+                onChange={(v) => patchFeature("waveformFpsCap", v)}
+              />
+            )}
+          </div>
+
+          {/* Analyser disconnect between samples */}
+          <ToggleRow
+            label="Disconnect AnalyserNode between samples"
+            checked={features.analyserDisconnectBetweenSamples}
+            disabled={togglesLocked}
+            onChange={(v) => patchFeature("analyserDisconnectBetweenSamples", v)}
+          />
+
+          {/* Skip analyser on iOS */}
+          <div className="flex flex-col gap-0.5">
+            <ToggleRow
+              label="Skip AnalyserNode on iOS (pulsing dot instead)"
+              checked={features.skipAnalyserOnIos}
+              disabled={togglesLocked}
+              onChange={(v) => patchFeature("skipAnalyserOnIos", v)}
+            />
+            <span className="pl-6 text-[11px] text-zinc-400">
+              {isIos() ? "iOS detected — will skip" : "Not iOS — toggle has no effect here"}
+            </span>
+          </div>
+
+          {/* AudioContext recreation */}
+          <div className="flex flex-col gap-1">
+            <ToggleRow
+              label="Periodic AudioContext close + recreate"
+              checked={features.audioContextRecreate}
+              disabled={togglesLocked}
+              onChange={(v) => patchFeature("audioContextRecreate", v)}
+            />
+            {features.audioContextRecreate && (
+              <NumberInput
+                label="Interval (seconds)"
+                value={features.audioContextRecreateIntervalSec}
+                min={10}
+                max={600}
+                disabled={togglesLocked}
+                onChange={(v) => patchFeature("audioContextRecreateIntervalSec", v)}
+              />
+            )}
+          </div>
+        </div>
+      </fieldset>
+
+      {/* ── Stressor embeds ───────────────────────────────────────── */}
       {features.motionLoop ? (
         <div className="rounded-lg border border-zinc-200 p-2 dark:border-zinc-700">
           <MotionLooper />
@@ -312,9 +530,21 @@ export function AudioCrashRepro() {
         </div>
       ) : null}
 
+      {/* ── Waveform / placeholder ────────────────────────────────── */}
       <div className="h-14 w-full text-zinc-900 dark:text-zinc-100">
-        {features.waveform ? (
-          <AudioWaveform analyser={analyserNode} className="h-full w-full" />
+        {effectiveWaveform ? (
+          <AudioWaveform
+            analyser={analyserNode}
+            sourceNode={sourceNode}
+            fpsCap={features.waveformFpsCap}
+            disconnectBetweenSamples={features.analyserDisconnectBetweenSamples}
+            className="h-full w-full"
+          />
+        ) : shouldSkipAnalyser ? (
+          <div className="flex h-full items-center justify-center rounded-md border border-dashed border-blue-300 px-2 text-xs text-blue-500 dark:border-blue-700 dark:text-blue-400">
+            <PulsingDot active={phase === "recording"} />
+            <span className="ml-2">iOS mode — AnalyserNode skipped (MediaRecorder only)</span>
+          </div>
         ) : (
           <div className="flex h-full items-center rounded-md border border-dashed border-zinc-300 px-2 text-xs text-zinc-500 dark:border-zinc-600 dark:text-zinc-400">
             Waveform off — no AudioContext / Analyser (MediaRecorder only).
@@ -322,6 +552,7 @@ export function AudioCrashRepro() {
         )}
       </div>
 
+      {/* ── Controls ──────────────────────────────────────────────── */}
       <div className="flex flex-wrap gap-2">
         <button
           type="button"
@@ -341,6 +572,7 @@ export function AudioCrashRepro() {
         </button>
       </div>
 
+      {/* ── Stats ─────────────────────────────────────────────────── */}
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
         <dt className="text-zinc-500">Status</dt>
         <dd className="font-mono">{phase}</dd>
@@ -348,12 +580,19 @@ export function AudioCrashRepro() {
         <dd className="font-mono">{formatElapsed(elapsedSec)}</dd>
         <dt className="text-zinc-500">Chunks (1s timeslice)</dt>
         <dd className="font-mono">
-          {chunkCount} ({chunksTotalBytes} bytes)
+          {chunkCount} ({formatBytes(chunksTotalBytes)})
         </dd>
+        {features.recorderRestartCycle && (
+          <>
+            <dt className="text-zinc-500">Recorder restarts</dt>
+            <dd className="font-mono">{restartCount}</dd>
+          </>
+        )}
       </dl>
 
       {error ? <p className="text-sm text-red-600 dark:text-red-400">{error}</p> : null}
 
+      {/* ── Run history ───────────────────────────────────────────── */}
       <section className="flex flex-col gap-2">
         <h2 className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Runs</h2>
         <ul className="flex max-h-64 flex-col gap-2 overflow-y-auto rounded-lg border border-zinc-200 p-2 text-sm dark:border-zinc-700">
@@ -406,6 +645,71 @@ export function AudioCrashRepro() {
         </ul>
       </section>
     </div>
+  );
+}
+
+// ── Small helper components ──────────────────────────────────────────────
+
+function ToggleRow({
+  label,
+  checked,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  disabled: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex cursor-pointer items-center gap-2">
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+function NumberInput({
+  label,
+  value,
+  min,
+  max,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  disabled: boolean;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <label className="flex items-center gap-2 pl-6 text-xs text-zinc-500 dark:text-zinc-400">
+      {label}:
+      <input
+        type="number"
+        className="w-16 rounded border border-zinc-300 bg-transparent px-1 py-0.5 text-xs dark:border-zinc-600"
+        value={value}
+        min={min}
+        max={max}
+        disabled={disabled}
+        onChange={(e) => {
+          const n = parseInt(e.target.value, 10);
+          if (!isNaN(n) && n >= min && n <= max) onChange(n);
+        }}
+      />
+    </label>
+  );
+}
+
+function PulsingDot({ active }: { active: boolean }) {
+  return (
+    <span
+      className={`inline-block size-3 rounded-full ${
+        active ? "animate-pulse bg-red-500" : "bg-zinc-400"
+      }`}
+    />
   );
 }
 

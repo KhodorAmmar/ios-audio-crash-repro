@@ -16,6 +16,15 @@ function cn(...parts: (string | undefined | false)[]): string {
 interface AudioWaveformProps {
   analyser: AnalyserNode | null;
   className?: string;
+  /** Cap animation to N fps (0 = unthrottled ~60fps). */
+  fpsCap?: number;
+  /**
+   * When true, disconnect the AnalyserNode from the audio graph between
+   * samples and reconnect only to read data. Requires `sourceNode` so we
+   * can call source.connect(analyser) / analyser.disconnect().
+   */
+  disconnectBetweenSamples?: boolean;
+  sourceNode?: MediaStreamAudioSourceNode | null;
 }
 
 type WaveformState = {
@@ -27,7 +36,13 @@ type WaveformState = {
 /**
  * Displays a bar waveform driven by an AnalyserNode. Bars are built imperatively for performance.
  */
-export function AudioWaveform({ analyser, className }: AudioWaveformProps) {
+export function AudioWaveform({
+  analyser,
+  className,
+  fpsCap = 0,
+  disconnectBetweenSamples = false,
+  sourceNode = null,
+}: AudioWaveformProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef<WaveformState | null>(null);
   if (stateRef.current === null) {
@@ -63,14 +78,42 @@ export function AudioWaveform({ analyser, className }: AudioWaveformProps) {
 
   useEffect(() => {
     let frameRef: number;
+    let lastFrameTime = 0;
+    const minFrameInterval = fpsCap > 0 ? 1000 / fpsCap : 0;
 
     const bufferLength = analyser?.frequencyBinCount ?? 0;
     const dataArray = new Uint8Array(bufferLength);
 
-    const animate = () => {
+    const animate = (timestamp?: number) => {
       if (!analyser) return;
 
+      // Throttle if fpsCap is set
+      if (minFrameInterval > 0 && timestamp !== undefined) {
+        if (timestamp - lastFrameTime < minFrameInterval) {
+          frameRef = requestAnimationFrame(animate);
+          return;
+        }
+        lastFrameTime = timestamp;
+      }
+
+      // Reconnect analyser just for sampling, then disconnect
+      if (disconnectBetweenSamples && sourceNode) {
+        try {
+          sourceNode.connect(analyser);
+        } catch {
+          /* already connected or source closed */
+        }
+      }
+
       analyser.getByteTimeDomainData(dataArray);
+
+      if (disconnectBetweenSamples && sourceNode) {
+        try {
+          analyser.disconnect();
+        } catch {
+          /* already disconnected */
+        }
+      }
 
       let maxAmplitude = 0;
       for (let i = 0; i < bufferLength; i++) {
@@ -105,7 +148,7 @@ export function AudioWaveform({ analyser, className }: AudioWaveformProps) {
         cancelAnimationFrame(frameRef);
       }
     };
-  }, [analyser, state]);
+  }, [analyser, state, fpsCap, disconnectBetweenSamples, sourceNode]);
 
   return (
     <div ref={containerRef} className={cn("flex items-center justify-center gap-[2px] overflow-hidden", className)} />
